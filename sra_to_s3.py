@@ -21,39 +21,44 @@ def process_accession(args):
         logging.info(f"Processing {accession}")
         temp_path = Path(temp_dir) / accession
         temp_path.mkdir(exist_ok=True)
+
+        raw_s3_dir = f"{s3_bucket}/raw"
         os.chdir(temp_path)
 
-        subprocess.run(
-            ["prefetch", accession],
-            check=True,
-            capture_output=True,
-            text=True,
-        )
-        subprocess.run(
-            ["fastq-dump", "--split-3", "--gzip", accession],
-            check=True,
-            capture_output=True,
-            text=True,
-        )
+        # Check if files already exist on S3 before downloading
+        for read in [1, 2]:
+            fastq_file = f"{accession}_{read}.fastq.gz"
+            s3_path = f"{raw_s3_dir}/{fastq_file}"
+            cmd = ["aws", "s3", "ls", s3_path]
+            logging.info(f"{' '.join(cmd)}")
+            try:
+                subprocess.run(cmd, check=True, capture_output=True, text=True)
+                logging.info(f"File {s3_path} already exists on S3, skipping download")
+                return (accession, True)
+            except subprocess.CalledProcessError:
+                pass
+
+        cmd = ["prefetch", accession]
+        logging.info(f"{' '.join(cmd)}")
+        subprocess.run(cmd, check=True, capture_output=True, text=True)
+
+        cmd = ["fastq-dump", "--split-3", "--gzip", accession]
+        logging.info(f"{' '.join(cmd)}")
+        subprocess.run(cmd, check=True, capture_output=True, text=True)
 
         for read in [1, 2]:
             fastq_file = f"{accession}_{read}.fastq.gz"
             if os.path.exists(fastq_file):
-                s3_path = f"s3://{s3_bucket}/{fastq_file}"
-                subprocess.run(
-                    ["aws", "s3", "cp", fastq_file, s3_path],
-                    check=True,
-                    capture_output=True,
-                    text=True,
-                )
+                s3_path = f"{raw_s3_dir}/{fastq_file}"
+                cmd = ["aws", "s3", "cp", fastq_file, s3_path]
+                logging.info(f"{' '.join(cmd)}")
+                subprocess.run(cmd, check=True, capture_output=True, text=True)
                 os.remove(fastq_file)
 
-        subprocess.run(
-            ["rm", "-rf", accession],
-            check=True,
-            capture_output=True,
-            text=True,
-        )
+        cmd = ["rm", "-rf", accession]
+        logging.info(f"{' '.join(cmd)}")
+        subprocess.run(cmd, check=True, capture_output=True, text=True)
+
         os.chdir("..")
         return (accession, True)
 
@@ -69,7 +74,7 @@ def main():
     )
     parser.add_argument("--s3-bucket", required=True, help="S3 bucket path")
     parser.add_argument(
-        "--processes", type=int, default=4, help="Number of parallel downloads"
+        "--n-processes", type=int, default=16, help="Number of parallel downloads"
     )
     parser.add_argument(
         "--temp-dir",
@@ -80,26 +85,35 @@ def main():
 
     args = parser.parse_args()
 
-    setup_logging(args.log_file)
-    os.makedirs(args.temp_dir, exist_ok=True)
+    log_file = args.log_file
+    s3_bucket = args.s3_bucket
+    s3_bucket = s3_bucket.rstrip('/')
+    temp_dir = args.temp_dir
+    accession_list = args.accession_list
+    n_processes = args.n_processes
 
-    with open(args.accession_list) as f:
+    if not os.path.exists(accession_list):
+        raise FileNotFoundError(f"Accession list file not found: {accession_list}")
+
+    if not s3_bucket.startswith("s3://"):
+        raise ValueError("S3 bucket path must start with 's3://'")
+
+
+    setup_logging(log_file)
+    os.makedirs(temp_dir, exist_ok=True)
+
+    with open(accession_list) as f:
         accessions = [line.strip() for line in f if line.strip()]
 
     logging.info(f"Starting download of {len(accessions)} accessions")
 
-    raw_dir = Path(args.s3_bucket) / "raw"
-    subprocess.run(
-        ["aws", "s3", "mb", raw_dir],
-        check=True,
-        capture_output=True,
-        text=True,
-    )
+    pool_args = [(acc, s3_bucket, temp_dir) for acc in accessions]
 
-    pool_args = [(acc, raw_dir, args.temp_dir) for acc in accessions]
-
-    with Pool(processes=args.processes) as pool:
-        results = pool.map(process_accession, pool_args)
+    with Pool(processes=n_processes) as pool:
+        results = []
+        for i, result in enumerate(pool.imap_unordered(process_accession, pool_args)):
+            results.append(result)
+            logging.info(f"Progress: {i+1}/{len(accessions)} accessions processed")
 
     success_count = sum(1 for _, success in results if success)
     logging.info(

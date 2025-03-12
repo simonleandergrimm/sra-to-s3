@@ -23,9 +23,13 @@ def process_accession(args):
         temp_path.mkdir(exist_ok=True)
 
         raw_s3_dir = f"{s3_bucket}/raw"
+
+        # Store current directory to restore later
+        original_dir = os.getcwd()
         os.chdir(temp_path)
 
         # Check if files already exist on S3 before downloading
+        all_files_exist = True
         for read in [1, 2]:
             fastq_file = f"{accession}_{read}.fastq.gz"
             s3_path = f"{raw_s3_dir}/{fastq_file}"
@@ -33,10 +37,15 @@ def process_accession(args):
             logging.info(f"{' '.join(cmd)}")
             try:
                 subprocess.run(cmd, check=True, capture_output=True, text=True)
-                logging.info(f"File {s3_path} already exists on S3, skipping download")
-                return (accession, True)
+                logging.info(f"File {s3_path} already exists on S3")
             except subprocess.CalledProcessError:
-                pass
+                all_files_exist = False
+                break
+
+        if all_files_exist:
+            logging.info(f"All files for {accession} already exist on S3, skipping download")
+            os.chdir(original_dir)
+            return (accession, True)
 
         cmd = ["prefetch", accession]
         logging.info(f"{' '.join(cmd)}")
@@ -46,6 +55,8 @@ def process_accession(args):
         logging.info(f"{' '.join(cmd)}")
         subprocess.run(cmd, check=True, capture_output=True, text=True)
 
+        # Upload any files that were generated
+        files_uploaded = False
         for read in [1, 2]:
             fastq_file = f"{accession}_{read}.fastq.gz"
             if os.path.exists(fastq_file):
@@ -54,16 +65,25 @@ def process_accession(args):
                 logging.info(f"{' '.join(cmd)}")
                 subprocess.run(cmd, check=True, capture_output=True, text=True)
                 os.remove(fastq_file)
-
+                files_uploaded = True
+        # Clean up
         cmd = ["rm", "-rf", accession]
         logging.info(f"{' '.join(cmd)}")
         subprocess.run(cmd, check=True, capture_output=True, text=True)
 
-        os.chdir("..")
-        return (accession, True)
+        # Always restore original directory
+        os.chdir(original_dir)
+
+        # Return success only if files were actually uploaded
+        return (accession, files_uploaded)
 
     except Exception as e:
         logging.error(f"Error processing {accession}: {str(e)}")
+        # Make sure to restore directory even on error
+        try:
+            os.chdir(original_dir)
+        except:
+            pass
         return (accession, False)
 
 
